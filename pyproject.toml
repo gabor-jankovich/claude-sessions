@@ -1,6 +1,6 @@
 [project]
 name = "claude-sessions"
-version = "0.1.0"
+version = "0.2.0"
 description = "Browse and resume Claude Code sessions"
 requires-python = ">=3.11"
 dependencies = []
