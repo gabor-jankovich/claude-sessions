@@ -154,8 +154,15 @@ def format_for_fzf(sessions: list[dict]) -> list[str]:
     return lines
 
 
-def pick_with_fzf(sessions: list[dict]) -> dict | None:
-    """Launch fzf and return the chosen session."""
+FORK_KEY = "ctrl-f"
+
+
+def pick_with_fzf(sessions: list[dict]) -> tuple[dict, bool] | None:
+    """Launch fzf and return (chosen session, fork?).
+
+    Enter resumes the session in place; FORK_KEY forks it into a new session
+    (original left untouched). Returns None if the user cancelled.
+    """
     lines = format_for_fzf(sessions)
     fzf_input = "\n".join(lines).encode()
 
@@ -169,6 +176,8 @@ def pick_with_fzf(sessions: list[dict]) -> dict | None:
             "--with-nth=2..",
             "--nth=2..",
             "--prompt=Resume session> ",
+            "--header=enter: resume  ·  ctrl-f: fork",
+            f"--expect={FORK_KEY}",
             "--height=40%",
             "--layout=reverse",
             "--info=inline",
@@ -183,32 +192,49 @@ def pick_with_fzf(sessions: list[dict]) -> dict | None:
     if result.returncode != 0:
         return None  # user cancelled
 
-    chosen_line = result.stdout.decode().strip()
+    # With --expect, the first output line is the pressed key (empty for
+    # Enter); the second is the chosen line.
+    out_lines = result.stdout.decode().split("\n")
+    if len(out_lines) < 2:
+        return None
+    pressed_key = out_lines[0].strip()
+    chosen_line = out_lines[1].strip()
     if not chosen_line:
         return None
+
+    fork = pressed_key == FORK_KEY
 
     # First field is the hidden session_id; map back to the session.
     chosen_id = chosen_line.split("\t", 1)[0]
     for s in sessions:
         if s["session_id"] == chosen_id:
-            return s
+            return s, fork
 
     return None
 
 
-def resume_session(session: dict) -> None:
-    """Invoke claude --resume <session_id> in the session's cwd."""
+def resume_session(session: dict, fork: bool = False) -> None:
+    """Invoke claude --resume <session_id> in the session's cwd.
+
+    When fork is True, pass --fork-session so claude creates a new session ID
+    and leaves the original conversation untouched.
+    """
     session_id = session["session_id"]
     cwd = session["cwd"] or str(Path.home())
 
-    print(f"Resuming session {session_id}")
+    action = "Forking" if fork else "Resuming"
+    print(f"{action} session {session_id}")
     print(f"  Project : {session['project']}")
     print(f"  Started : {session['timestamp'].strftime('%Y-%m-%d %H:%M')}")
     print(f"  Prompt  : {session['first_prompt'][:80]}")
     print()
 
+    cmd = ["claude", "--resume", session_id]
+    if fork:
+        cmd.append("--fork-session")
+
     os.chdir(cwd)
-    result = subprocess.run(["claude", "--resume", session_id])
+    result = subprocess.run(cmd)
     sys.exit(result.returncode)
 
 
@@ -223,7 +249,8 @@ def main() -> None:
     if chosen is None:
         sys.exit(0)
 
-    resume_session(chosen)
+    session, fork = chosen
+    resume_session(session, fork=fork)
 
 
 if __name__ == "__main__":
