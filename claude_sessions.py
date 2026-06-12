@@ -3,6 +3,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from datetime import datetime
@@ -129,14 +130,25 @@ DIM = "\033[2m"
 RESET = "\033[0m"
 
 
+NEW_SESSION_PREFIX = "__NEW__:"
+
+
 def format_for_fzf(sessions: list[dict]) -> list[str]:
     """Format sessions as lines for fzf input.
 
     Each line is "<session_id>\t<display>"; the session_id field is hidden
     from view/search (fzf --with-nth/--nth=2..) and used to map the chosen
     line back to its session, since --ansi strips color codes from output.
+
+    A single "+ New session" entry is prefixed with NEW_SESSION_PREFIX
+    followed by the cwd to start in (the directory claude-sessions was
+    invoked from).
     """
     lines = []
+
+    cwd = os.getcwd()
+    lines.append(f"{NEW_SESSION_PREFIX}{cwd}\t+ New session  [{cwd}]")
+
     for s in sessions:
         dt_str = s["timestamp"].strftime("%Y-%m-%d %H:%M")
         prompt = s["first_prompt"].replace("\n", " ")
@@ -155,13 +167,72 @@ def format_for_fzf(sessions: list[dict]) -> list[str]:
 
 
 FORK_KEY = "ctrl-f"
+BROWSE_KEY = "ctrl-o"
+BROWSE_SENTINEL = "\x00BROWSE\x00"
 
 
-def pick_with_fzf(sessions: list[dict]) -> tuple[dict, bool] | None:
-    """Launch fzf and return (chosen session, fork?).
+def browse_directory(start: str) -> str | None:
+    """Interactive directory walker starting at `start`.
 
-    Enter resumes the session in place; FORK_KEY forks it into a new session
-    (original left untouched). Returns None if the user cancelled.
+    Each step shows the entries of the current directory (with "." to pick
+    the current directory and ".." to go up) and a right-side preview of the
+    highlighted entry's contents. Returns the chosen directory, or None if
+    cancelled.
+    """
+    current = Path(start)
+    while True:
+        try:
+            subdirs = sorted(
+                p.name for p in current.iterdir()
+                if p.is_dir() and not p.name.startswith(".")
+            )
+        except OSError:
+            subdirs = []
+
+        entries = ["."]
+        if current != current.parent:
+            entries.append("..")
+        entries.extend(subdirs)
+
+        preview = f"ls -la {shlex.quote(str(current))}/{{}}"
+
+        result = subprocess.run(
+            [
+                "fzf",
+                "--prompt", f"{current}> ",
+                "--header", ". : select this directory  ·  enter: open  ·  esc: cancel",
+                "--height=60%",
+                "--layout=reverse",
+                "--preview", preview,
+                "--preview-window=right:50%",
+            ],
+            input="\n".join(entries).encode(),
+            capture_output=True,
+        )
+
+        if result.returncode != 0:
+            return None  # cancelled
+
+        choice = result.stdout.decode().strip()
+        if not choice:
+            return None
+
+        if choice == ".":
+            return str(current)
+        elif choice == "..":
+            current = current.parent
+        else:
+            current = current / choice
+
+
+def pick_with_fzf(sessions: list[dict]) -> tuple[dict, bool] | str | None:
+    """Launch fzf and return (chosen session, fork?), a cwd string for a new
+    session, or None if the user cancelled.
+
+    Enter resumes the session in place (or starts a new session for "+ New
+    session" entries); FORK_KEY forks the selected session into a new one
+    (original left untouched); BROWSE_KEY opens a directory browser to pick
+    a location for a new session.
     """
     lines = format_for_fzf(sessions)
     fzf_input = "\n".join(lines).encode()
@@ -176,8 +247,8 @@ def pick_with_fzf(sessions: list[dict]) -> tuple[dict, bool] | None:
             "--with-nth=2..",
             "--nth=2..",
             "--prompt=Resume session> ",
-            "--header=enter: resume  ·  ctrl-f: fork",
-            f"--expect={FORK_KEY}",
+            "--header=enter: resume/new  ·  ctrl-f: fork  ·  ctrl-o: browse dirs",
+            f"--expect={FORK_KEY},{BROWSE_KEY}",
             "--height=40%",
             "--layout=reverse",
             "--info=inline",
@@ -199,6 +270,10 @@ def pick_with_fzf(sessions: list[dict]) -> tuple[dict, bool] | None:
         return None
     pressed_key = out_lines[0].strip()
     chosen_line = out_lines[1].strip()
+
+    if pressed_key == BROWSE_KEY:
+        return BROWSE_SENTINEL
+
     if not chosen_line:
         return None
 
@@ -206,6 +281,10 @@ def pick_with_fzf(sessions: list[dict]) -> tuple[dict, bool] | None:
 
     # First field is the hidden session_id; map back to the session.
     chosen_id = chosen_line.split("\t", 1)[0]
+
+    if chosen_id.startswith(NEW_SESSION_PREFIX):
+        return chosen_id[len(NEW_SESSION_PREFIX):]
+
     for s in sessions:
         if s["session_id"] == chosen_id:
             return s, fork
@@ -238,6 +317,17 @@ def resume_session(session: dict, fork: bool = False) -> None:
     sys.exit(result.returncode)
 
 
+def start_new_session(cwd: str) -> None:
+    """Invoke claude (no args) in the given directory to start a fresh session."""
+    print("Starting new session")
+    print(f"  Directory: {cwd}")
+    print()
+
+    os.chdir(cwd)
+    result = subprocess.run(["claude"])
+    sys.exit(result.returncode)
+
+
 def main() -> None:
     sessions = load_all_sessions()
 
@@ -248,6 +338,17 @@ def main() -> None:
     chosen = pick_with_fzf(sessions)
     if chosen is None:
         sys.exit(0)
+
+    if chosen == BROWSE_SENTINEL:
+        cwd = browse_directory(os.getcwd())
+        if cwd is None:
+            sys.exit(0)
+        start_new_session(cwd)
+        return
+
+    if isinstance(chosen, str):
+        start_new_session(chosen)
+        return
 
     session, fork = chosen
     resume_session(session, fork=fork)
