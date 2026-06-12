@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime
@@ -163,6 +164,9 @@ RESET = "\033[0m"
 CYAN = "\033[36m"
 
 
+NEW_SESSION_PREFIX = "__NEW__:"
+
+
 def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
     """Format sessions as lines for fzf input.
 
@@ -172,8 +176,16 @@ def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
 
     A user label (set via ctrl-l, stored in LABELS_FILE) is shown up front
     and lives in the searchable field so you can find a session by it.
+
+    A single "+ New session" entry is prefixed with NEW_SESSION_PREFIX
+    followed by the cwd to start in (the directory claude-sessions was
+    invoked from).
     """
     lines = []
+
+    cwd = os.getcwd()
+    lines.append(f"{NEW_SESSION_PREFIX}{cwd}\t+ New session  [{cwd}]")
+
     for s in sessions:
         dt_str = s["timestamp"].strftime("%Y-%m-%d %H:%M")
         prompt = s["first_prompt"].replace("\n", " ")
@@ -196,16 +208,76 @@ def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
 FORK_KEY = "ctrl-f"
 LABEL_KEY = "ctrl-l"
 DIR_KEY = "ctrl-d"
+BROWSE_KEY = "ctrl-o"
+BROWSE_SENTINEL = "\x00BROWSE\x00"
+DIR_SENTINEL = "\x00DIR\x00"
+
+
+def browse_directory(start: str) -> str | None:
+    """Interactive directory walker starting at `start`.
+
+    Each step shows the entries of the current directory (with "." to pick
+    the current directory and ".." to go up) and a right-side preview of the
+    highlighted entry's contents. Returns the chosen directory, or None if
+    cancelled.
+    """
+    current = Path(start)
+    while True:
+        try:
+            subdirs = sorted(
+                p.name for p in current.iterdir()
+                if p.is_dir() and not p.name.startswith(".")
+            )
+        except OSError:
+            subdirs = []
+
+        entries = ["."]
+        if current != current.parent:
+            entries.append("..")
+        entries.extend(subdirs)
+
+        preview = f"ls -la {shlex.quote(str(current))}/{{}}"
+
+        result = subprocess.run(
+            [
+                "fzf",
+                "--prompt", f"{current}> ",
+                "--header", ". : select this directory  ·  enter: open  ·  esc: cancel",
+                "--height=60%",
+                "--layout=reverse",
+                "--preview", preview,
+                "--preview-window=right:50%",
+            ],
+            input="\n".join(entries).encode(),
+            capture_output=True,
+        )
+
+        if result.returncode != 0:
+            return None  # cancelled
+
+        choice = result.stdout.decode().strip()
+        if not choice:
+            return None
+
+        if choice == ".":
+            return str(current)
+        elif choice == "..":
+            current = current.parent
+        else:
+            current = current / choice
 
 
 def pick_with_fzf(
     sessions: list[dict], labels: dict[str, str], cwd_only: bool
-) -> tuple[dict, str] | None:
-    """Launch fzf and return (chosen session, pressed_key).
+) -> tuple[dict, str] | str | None:
+    """Launch fzf and return one of:
 
-    pressed_key is "" for Enter (resume), FORK_KEY for fork, LABEL_KEY for
-    relabel, DIR_KEY to toggle the this-directory-only filter. Returns None
-    if the user cancelled.
+    * (chosen session, pressed_key) — "" for Enter (resume), FORK_KEY for
+      fork, LABEL_KEY for relabel
+    * DIR_SENTINEL — toggle the this-directory-only filter
+    * BROWSE_SENTINEL — open the directory browser for a new session
+    * a cwd string — start a new session there ("+ New session" row)
+    * None — the user cancelled
     """
     lines = format_for_fzf(sessions, labels)
     fzf_input = "\n".join(lines).encode()
@@ -220,8 +292,9 @@ def pick_with_fzf(
             "--delimiter=\t",
             "--with-nth=2..",
             f"--prompt=Resume ({scope})> ",
-            "--header=enter: resume  ·  ctrl-f: fork  ·  ctrl-l: label  ·  ctrl-d: dir filter",
-            f"--expect={FORK_KEY},{LABEL_KEY},{DIR_KEY}",
+            "--header=enter: resume/new  ·  ctrl-f: fork  ·  ctrl-l: label  "
+            "·  ctrl-d: dir filter  ·  ctrl-o: browse dirs",
+            f"--expect={FORK_KEY},{LABEL_KEY},{DIR_KEY},{BROWSE_KEY}",
             "--height=40%",
             "--layout=reverse",
             "--info=inline",
@@ -245,11 +318,22 @@ def pick_with_fzf(
         return None
     pressed_key = out_lines[0].strip()
     chosen_line = out_lines[1].strip()
+
+    # These act on the picker itself, not on the highlighted row.
+    if pressed_key == BROWSE_KEY:
+        return BROWSE_SENTINEL
+    if pressed_key == DIR_KEY:
+        return DIR_SENTINEL
+
     if not chosen_line:
         return None
 
     # First field is the hidden session_id; map back to the session.
     chosen_id = chosen_line.split("\t", 1)[0]
+
+    if chosen_id.startswith(NEW_SESSION_PREFIX):
+        return chosen_id[len(NEW_SESSION_PREFIX):]
+
     for s in sessions:
         if s["session_id"] == chosen_id:
             return s, pressed_key
@@ -295,6 +379,17 @@ def prompt_label(session: dict, labels: dict[str, str]) -> None:
     save_labels(labels)
 
 
+def start_new_session(cwd: str) -> None:
+    """Invoke claude (no args) in the given directory to start a fresh session."""
+    print("Starting new session")
+    print(f"  Directory: {cwd}")
+    print()
+
+    os.chdir(cwd)
+    result = subprocess.run(["claude"])
+    sys.exit(result.returncode)
+
+
 def main() -> None:
     sessions = load_all_sessions()
 
@@ -314,13 +409,25 @@ def main() -> None:
         if chosen is None:
             sys.exit(0)
 
+        if chosen == DIR_SENTINEL:
+            cwd_only = not cwd_only
+            continue  # reopen picker with the filter flipped
+
+        if chosen == BROWSE_SENTINEL:
+            cwd = browse_directory(os.getcwd())
+            if cwd is None:
+                sys.exit(0)
+            start_new_session(cwd)
+            return
+
+        if isinstance(chosen, str):  # "+ New session" row: the cwd to start in
+            start_new_session(chosen)
+            return
+
         session, key = chosen
         if key == LABEL_KEY:
             prompt_label(session, labels)
             continue  # reopen picker with the updated label
-        if key == DIR_KEY:
-            cwd_only = not cwd_only
-            continue  # reopen picker with the filter flipped
         resume_session(session, fork=(key == FORK_KEY))
 
 
