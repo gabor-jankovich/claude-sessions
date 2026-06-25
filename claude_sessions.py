@@ -3,14 +3,46 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 
+def humanize_prompt(text: str) -> str:
+    """Render a slash-command prompt without its XML wrapper tags.
+
+    A first prompt run via a slash command looks like
+    "<command-name>/g2</command-name>\\n<command-args>how many...</command-args>".
+    Turn that into "/g2 how many...". For anything else, just strip stray tags.
+    """
+    name = re.search(r"<command-name>(.*?)</command-name>", text, re.S)
+    if name:
+        args = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
+        parts = [name.group(1).strip()]
+        if args and args.group(1).strip():
+            parts.append(args.group(1).strip())
+        return " ".join(parts)
+    # ponytail: generic tag strip for any other wrapped content
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+LABELS_FILE = Path.home() / ".claude" / "session-labels.json"
 PROMPT_MAX_LEN = 120
+
+
+def load_labels() -> dict[str, str]:
+    """Map of session_id -> user label. Missing/corrupt file = no labels."""
+    try:
+        return json.loads(LABELS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_labels(labels: dict[str, str]) -> None:
+    LABELS_FILE.write_text(json.dumps(labels, indent=2), encoding="utf-8")
 
 
 def extract_session_info(jsonl_path: Path) -> dict | None:
@@ -73,6 +105,7 @@ def extract_session_info(jsonl_path: Path) -> dict | None:
                     else:
                         text = ""
 
+                    text = humanize_prompt(text)
                     if text:
                         first_user_prompt = text
 
@@ -127,14 +160,18 @@ def load_all_sessions() -> list[dict]:
 
 DIM = "\033[2m"
 RESET = "\033[0m"
+CYAN = "\033[36m"
 
 
-def format_for_fzf(sessions: list[dict]) -> list[str]:
+def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
     """Format sessions as lines for fzf input.
 
     Each line is "<session_id>\t<display>"; the session_id field is hidden
-    from view/search (fzf --with-nth/--nth=2..) and used to map the chosen
-    line back to its session, since --ansi strips color codes from output.
+    from view/search (fzf --with-nth=2..) and used to map the chosen line
+    back to its session, since --ansi strips color codes from output.
+
+    A user label (set via ctrl-l, stored in LABELS_FILE) is shown up front
+    and lives in the searchable field so you can find a session by it.
     """
     lines = []
     for s in sessions:
@@ -149,21 +186,26 @@ def format_for_fzf(sessions: list[dict]) -> list[str]:
             display = f"{title}  {DIM}— {prompt}{RESET}"
         else:
             display = prompt
-        line = f"{s['session_id']}\t{dt_str}  [{project}]  {display}"
+        label = labels.get(s["session_id"])
+        tag = f"{CYAN}#{label}{RESET}  " if label else ""
+        line = f"{s['session_id']}\t{tag}{dt_str}  [{project}]  {display}"
         lines.append(line)
     return lines
 
 
 FORK_KEY = "ctrl-f"
+LABEL_KEY = "ctrl-l"
 
 
-def pick_with_fzf(sessions: list[dict]) -> tuple[dict, bool] | None:
-    """Launch fzf and return (chosen session, fork?).
+def pick_with_fzf(
+    sessions: list[dict], labels: dict[str, str]
+) -> tuple[dict, str] | None:
+    """Launch fzf and return (chosen session, pressed_key).
 
-    Enter resumes the session in place; FORK_KEY forks it into a new session
-    (original left untouched). Returns None if the user cancelled.
+    pressed_key is "" for Enter (resume), FORK_KEY for fork, LABEL_KEY for
+    relabel. Returns None if the user cancelled.
     """
-    lines = format_for_fzf(sessions)
+    lines = format_for_fzf(sessions, labels)
     fzf_input = "\n".join(lines).encode()
 
     result = subprocess.run(
@@ -174,10 +216,9 @@ def pick_with_fzf(sessions: list[dict]) -> tuple[dict, bool] | None:
             "--no-sort",
             "--delimiter=\t",
             "--with-nth=2..",
-            "--nth=2..",
             "--prompt=Resume session> ",
-            "--header=enter: resume  ·  ctrl-f: fork",
-            f"--expect={FORK_KEY}",
+            "--header=enter: resume  ·  ctrl-f: fork  ·  ctrl-l: label",
+            f"--expect={FORK_KEY},{LABEL_KEY}",
             "--height=40%",
             "--layout=reverse",
             "--info=inline",
@@ -202,13 +243,11 @@ def pick_with_fzf(sessions: list[dict]) -> tuple[dict, bool] | None:
     if not chosen_line:
         return None
 
-    fork = pressed_key == FORK_KEY
-
     # First field is the hidden session_id; map back to the session.
     chosen_id = chosen_line.split("\t", 1)[0]
     for s in sessions:
         if s["session_id"] == chosen_id:
-            return s, fork
+            return s, pressed_key
 
     return None
 
@@ -238,6 +277,19 @@ def resume_session(session: dict, fork: bool = False) -> None:
     sys.exit(result.returncode)
 
 
+def prompt_label(session: dict, labels: dict[str, str]) -> None:
+    """Ask for a label for the session and persist it. Empty input clears it."""
+    sid = session["session_id"]
+    current = labels.get(sid, "")
+    print(f"\nLabel for: {session['first_prompt'][:80]}")
+    new = input(f"Label [{current}] (empty clears): ").strip()
+    if new:
+        labels[sid] = new
+    else:
+        labels.pop(sid, None)
+    save_labels(labels)
+
+
 def main() -> None:
     sessions = load_all_sessions()
 
@@ -245,12 +297,18 @@ def main() -> None:
         print("No sessions found.", file=sys.stderr)
         sys.exit(1)
 
-    chosen = pick_with_fzf(sessions)
-    if chosen is None:
-        sys.exit(0)
+    labels = load_labels()
 
-    session, fork = chosen
-    resume_session(session, fork=fork)
+    while True:
+        chosen = pick_with_fzf(sessions, labels)
+        if chosen is None:
+            sys.exit(0)
+
+        session, key = chosen
+        if key == LABEL_KEY:
+            prompt_label(session, labels)
+            continue  # reopen picker with the updated label
+        resume_session(session, fork=(key == FORK_KEY))
 
 
 if __name__ == "__main__":
