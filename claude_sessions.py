@@ -195,19 +195,22 @@ def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
 
 FORK_KEY = "ctrl-f"
 LABEL_KEY = "ctrl-l"
+DIR_KEY = "ctrl-d"
 
 
 def pick_with_fzf(
-    sessions: list[dict], labels: dict[str, str]
+    sessions: list[dict], labels: dict[str, str], cwd_only: bool
 ) -> tuple[dict, str] | None:
     """Launch fzf and return (chosen session, pressed_key).
 
     pressed_key is "" for Enter (resume), FORK_KEY for fork, LABEL_KEY for
-    relabel. Returns None if the user cancelled.
+    relabel, DIR_KEY to toggle the this-directory-only filter. Returns None
+    if the user cancelled.
     """
     lines = format_for_fzf(sessions, labels)
     fzf_input = "\n".join(lines).encode()
 
+    scope = "this dir" if cwd_only else "all dirs"
     result = subprocess.run(
         [
             "fzf",
@@ -216,9 +219,9 @@ def pick_with_fzf(
             "--no-sort",
             "--delimiter=\t",
             "--with-nth=2..",
-            "--prompt=Resume session> ",
-            "--header=enter: resume  ·  ctrl-f: fork  ·  ctrl-l: label",
-            f"--expect={FORK_KEY},{LABEL_KEY}",
+            f"--prompt=Resume ({scope})> ",
+            "--header=enter: resume  ·  ctrl-f: fork  ·  ctrl-l: label  ·  ctrl-d: dir filter",
+            f"--expect={FORK_KEY},{LABEL_KEY},{DIR_KEY}",
             "--height=40%",
             "--layout=reverse",
             "--info=inline",
@@ -298,9 +301,14 @@ def main() -> None:
         sys.exit(1)
 
     labels = load_labels()
+    start_cwd = os.getcwd()
+    cwd_only = False
 
     while True:
-        chosen = pick_with_fzf(sessions, labels)
+        shown = (
+            [s for s in sessions if s["cwd"] == start_cwd] if cwd_only else sessions
+        )
+        chosen = pick_with_fzf(shown, labels, cwd_only)
         if chosen is None:
             sys.exit(0)
 
@@ -308,6 +316,9 @@ def main() -> None:
         if key == LABEL_KEY:
             prompt_label(session, labels)
             continue  # reopen picker with the updated label
+        if key == DIR_KEY:
+            cwd_only = not cwd_only
+            continue  # reopen picker with the filter flipped
         resume_session(session, fork=(key == FORK_KEY))
 
 
