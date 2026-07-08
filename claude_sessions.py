@@ -230,7 +230,9 @@ def pick_with_fzf(
             "echo {2..}",
         ],
         input=fzf_input,
-        capture_output=True,
+        # fzf draws its picker UI to stderr (esp. in --height mode); capture
+        # only stdout (the chosen line) so the UI still reaches the terminal.
+        stdout=subprocess.PIPE,
     )
 
     if result.returncode != 0:
