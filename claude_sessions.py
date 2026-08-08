@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -31,7 +32,9 @@ def humanize_prompt(text: str) -> str:
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 LABELS_FILE = Path.home() / ".claude" / "session-labels.json"
+TODOS_DIR = Path.home() / ".claude" / "todos"
 PROMPT_MAX_LEN = 120
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def load_labels() -> dict[str, str]:
@@ -209,8 +212,90 @@ FORK_KEY = "ctrl-f"
 LABEL_KEY = "ctrl-l"
 DIR_KEY = "ctrl-d"
 BROWSE_KEY = "ctrl-o"
+DELETE_KEY = "ctrl-x"
 BROWSE_SENTINEL = "\x00BROWSE\x00"
 DIR_SENTINEL = "\x00DIR\x00"
+
+HEADER = (
+    "enter: resume/new  ·  ctrl-f: fork  ·  ctrl-l: label  "
+    "·  ctrl-d: dir filter  ·  ctrl-o: browse dirs  ·  ctrl-x: delete"
+)
+CONFIRM_HEADER = (
+    "⚠  DELETE this session permanently?  press ctrl-x again to confirm  "
+    "·  move the cursor or press esc to cancel"
+)
+
+
+def session_file(session_id: str) -> Path | None:
+    """Return the JSONL file of `session_id`, or None if not found."""
+    if not SESSION_ID_RE.match(session_id):
+        return None
+    for path in PROJECTS_DIR.glob(f"*/{session_id}.jsonl"):
+        return path
+    return None
+
+
+def delete_session(session_id: str) -> None:
+    """Delete a session's JSONL transcript and its leftover todo files."""
+    path = session_file(session_id)
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        return
+    if TODOS_DIR.is_dir():
+        for todo in TODOS_DIR.glob(f"{session_id}*.json"):
+            try:
+                todo.unlink()
+            except OSError:
+                pass
+
+
+def self_cmd() -> str:
+    """Shell command that re-invokes this script (for fzf child processes)."""
+    return shlex.join([sys.executable, str(Path(__file__).resolve())])
+
+
+def delete_binds(state_path: str, cwd_only: bool) -> list[str]:
+    """fzf --bind args implementing two-step ctrl-x deletion.
+
+    First ctrl-x on a row records its session id in `state_path` and swaps the
+    header for a confirmation prompt. A second ctrl-x on the *same* row deletes
+    the session and reloads the list. Moving the cursor disarms it.
+
+    The reload repeats the active directory filter so ctrl-d's scope survives
+    a delete.
+    """
+    state = shlex.quote(state_path)
+    me = self_cmd()
+    scope = f" --cwd {shlex.quote(os.getcwd())}" if cwd_only else ""
+
+    arm = (
+        f"case {{1}} in {NEW_SESSION_PREFIX}*) exit 0;; esac; "
+        f'if [ "$(cat {state} 2>/dev/null)" = {{1}} ]; then '
+        f": > {state}; "
+        f'echo "execute-silent({me} --delete {{1}})'
+        f"+reload({me} --print-list{scope})"
+        f'+change-header({HEADER})"; '
+        f"else "
+        f"printf %s {{1}} > {state}; "
+        f'echo "change-header({CONFIRM_HEADER})"; '
+        f"fi"
+    )
+    disarm = (
+        f"if [ -s {state} ]; then "
+        f": > {state}; "
+        f'echo "change-header({HEADER})"; '
+        f"fi"
+    )
+
+    # Colon form (`action:command`) — the command runs to the end of the
+    # argument, so no paren-balancing rules apply to the shell snippets.
+    return [
+        "--bind", f"{DELETE_KEY}:transform:{arm}",
+        "--bind", f"focus:transform:{disarm}",
+    ]
 
 
 def browse_directory(start: str) -> str | None:
@@ -283,30 +368,39 @@ def pick_with_fzf(
     fzf_input = "\n".join(lines).encode()
 
     scope = "this dir" if cwd_only else "all dirs"
-    result = subprocess.run(
-        [
-            "fzf",
-            "--ansi",
-            "--exact",
-            "--no-sort",
-            "--delimiter=\t",
-            "--with-nth=2..",
-            f"--prompt=Resume ({scope})> ",
-            "--header=enter: resume/new  ·  ctrl-f: fork  ·  ctrl-l: label  "
-            "·  ctrl-d: dir filter  ·  ctrl-o: browse dirs",
-            f"--expect={FORK_KEY},{LABEL_KEY},{DIR_KEY},{BROWSE_KEY}",
-            "--height=40%",
-            "--layout=reverse",
-            "--info=inline",
-            "--preview-window=down:3:wrap",
-            "--preview",
-            "echo {2..}",
-        ],
-        input=fzf_input,
-        # fzf draws its picker UI to stderr (esp. in --height mode); capture
-        # only stdout (the chosen line) so the UI still reaches the terminal.
-        stdout=subprocess.PIPE,
-    )
+    fd, state_path = tempfile.mkstemp(prefix="claude-sessions-delete-")
+    os.close(fd)
+    try:
+        result = subprocess.run(
+            [
+                "fzf",
+                "--ansi",
+                "--exact",
+                "--no-sort",
+                "--delimiter=\t",
+                "--with-nth=2..",
+                f"--prompt=Resume ({scope})> ",
+                f"--header={HEADER}",
+                f"--expect={FORK_KEY},{LABEL_KEY},{DIR_KEY},{BROWSE_KEY}",
+                "--height=40%",
+                "--layout=reverse",
+                "--info=inline",
+                "--preview-window=down:3:wrap",
+                "--preview",
+                "echo {2..}",
+                *delete_binds(state_path, cwd_only),
+            ],
+            input=fzf_input,
+            # fzf draws its picker UI to stderr (esp. in --height mode);
+            # capture only stdout (the chosen line) so the UI still reaches
+            # the terminal.
+            stdout=subprocess.PIPE,
+        )
+    finally:
+        try:
+            os.unlink(state_path)
+        except OSError:
+            pass
 
     if result.returncode != 0:
         return None  # user cancelled
@@ -337,6 +431,14 @@ def pick_with_fzf(
     for s in sessions:
         if s["session_id"] == chosen_id:
             return s, pressed_key
+
+    # The list may have been reloaded (after a delete) and now contain a
+    # session that appeared since startup — look it up on disk.
+    path = session_file(chosen_id)
+    if path is not None:
+        info = extract_session_info(path)
+        if info:
+            return info, pressed_key
 
     return None
 
@@ -391,6 +493,19 @@ def start_new_session(cwd: str) -> None:
 
 
 def main() -> None:
+    # Helper modes used by fzf's own child processes (see delete_binds).
+    args = sys.argv[1:]
+    if args and args[0] == "--print-list":
+        listed = load_all_sessions()
+        if len(args) > 2 and args[1] == "--cwd":
+            listed = [s for s in listed if s["cwd"] == args[2]]
+        print("\n".join(format_for_fzf(listed, load_labels())))
+        return
+    if args and args[0] == "--delete":
+        if len(args) > 1:
+            delete_session(args[1])
+        return
+
     sessions = load_all_sessions()
 
     if not sessions:
@@ -402,6 +517,10 @@ def main() -> None:
     cwd_only = False
 
     while True:
+        # Drop sessions deleted with ctrl-x during the previous picker run;
+        # one directory scan, no re-parsing of the transcripts.
+        alive = {p.stem for p in PROJECTS_DIR.glob("*/*.jsonl")}
+        sessions = [s for s in sessions if s["session_id"] in alive]
         shown = (
             [s for s in sessions if s["cwd"] == start_cwd] if cwd_only else sessions
         )
