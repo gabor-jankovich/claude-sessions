@@ -257,7 +257,10 @@ def self_cmd() -> str:
     return shlex.join([sys.executable, str(Path(__file__).resolve())])
 
 
-def delete_binds(state_path: str, cwd_only: bool) -> list[str]:
+FILTER_CWD_ENV = "CLAUDE_SESSIONS_FILTER_CWD"
+
+
+def delete_binds(state_path: str) -> list[str]:
     """fzf --bind args implementing two-step ctrl-x deletion.
 
     First ctrl-x on a row records its session id in `state_path` and swaps the
@@ -265,18 +268,26 @@ def delete_binds(state_path: str, cwd_only: bool) -> list[str]:
     the session and reloads the list. Moving the cursor disarms it.
 
     The reload repeats the active directory filter so ctrl-d's scope survives
-    a delete.
+    a delete. The filter travels in FILTER_CWD_ENV rather than on the reload
+    command line, because fzf parses `reload(...)` by matching parentheses — a
+    project path containing one would truncate the action.
+
+    fzf shell-quotes {1} before the snippet runs, so the id cannot break out of
+    the shell. The `case` guards are about fzf's own action parsing: an id with
+    a paren or a space in it would corrupt the `execute-silent(...)` string this
+    builds, so anything that is not a plain session id is ignored outright.
     """
     state = shlex.quote(state_path)
     me = self_cmd()
-    scope = f" --cwd {shlex.quote(os.getcwd())}" if cwd_only else ""
 
     arm = (
+        # not a session row, or not a well-formed session id -> do nothing
         f"case {{1}} in {NEW_SESSION_PREFIX}*) exit 0;; esac; "
+        f"case {{1}} in *[!A-Za-z0-9_-]*|'') exit 0;; esac; "
         f'if [ "$(cat {state} 2>/dev/null)" = {{1}} ]; then '
         f": > {state}; "
         f'echo "execute-silent({me} --delete {{1}})'
-        f"+reload({me} --print-list{scope})"
+        f"+reload({me} --print-list)"
         f'+change-header({HEADER})"; '
         f"else "
         f"printf %s {{1}} > {state}; "
@@ -388,9 +399,12 @@ def pick_with_fzf(
                 "--preview-window=down:3:wrap",
                 "--preview",
                 "echo {2..}",
-                *delete_binds(state_path, cwd_only),
+                *delete_binds(state_path),
             ],
             input=fzf_input,
+            # The reload child re-reads this instead of taking the filter on
+            # its command line, so no path is spliced into an fzf action.
+            env={**os.environ, FILTER_CWD_ENV: os.getcwd() if cwd_only else ""},
             # fzf draws its picker UI to stderr (esp. in --height mode);
             # capture only stdout (the chosen line) so the UI still reaches
             # the terminal.
@@ -497,8 +511,9 @@ def main() -> None:
     args = sys.argv[1:]
     if args and args[0] == "--print-list":
         listed = load_all_sessions()
-        if len(args) > 2 and args[1] == "--cwd":
-            listed = [s for s in listed if s["cwd"] == args[2]]
+        only_cwd = os.environ.get(FILTER_CWD_ENV, "")
+        if only_cwd:
+            listed = [s for s in listed if s["cwd"] == only_cwd]
         print("\n".join(format_for_fzf(listed, load_labels())))
         return
     if args and args[0] == "--delete":
