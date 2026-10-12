@@ -29,6 +29,7 @@ def humanize_prompt(text: str) -> str:
 
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+OMP_SESSIONS_DIR = Path.home() / ".omp" / "agent" / "sessions"
 LABELS_FILE = Path.home() / ".claude" / "session-labels.json"
 PROMPT_MAX_LEN = 120
 
@@ -43,6 +44,29 @@ def load_labels() -> dict[str, str]:
 
 def save_labels(labels: dict[str, str]) -> None:
     LABELS_FILE.write_text(json.dumps(labels, indent=2), encoding="utf-8")
+
+
+def content_text(content) -> str:
+    """Flatten a message's content (str or list of blocks) to plain text."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return " ".join(parts).strip()
+    return ""
+
+
+def human_project(cwd: str) -> str:
+    """~/foo/bar from the real cwd (dir-name decoding mangles dashes)."""
+    home = str(Path.home())
+    if cwd == home or cwd.startswith(home + "/"):
+        return "~" + cwd[len(home):]
+    return cwd
 
 
 def extract_session_info(jsonl_path: Path) -> dict | None:
@@ -89,23 +113,8 @@ def extract_session_info(jsonl_path: Path) -> dict | None:
                     cwd = entry.get("cwd", "")
 
                 if first_user_prompt is None:
-                    msg = entry.get("message", {})
-                    content = msg.get("content", "")
-                    if isinstance(content, str):
-                        text = content.strip()
-                    elif isinstance(content, list):
-                        # content is a list of blocks
-                        parts = []
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                parts.append(block.get("text", ""))
-                            elif isinstance(block, str):
-                                parts.append(block)
-                        text = " ".join(parts).strip()
-                    else:
-                        text = ""
-
-                    text = humanize_prompt(text)
+                    content = entry.get("message", {}).get("content", "")
+                    text = humanize_prompt(content_text(content))
                     if text:
                         first_user_prompt = text
 
@@ -122,19 +131,55 @@ def extract_session_info(jsonl_path: Path) -> dict | None:
     except ValueError:
         return None
 
-    # Human-readable project path: convert -home-kjozsa-foo-bar -> ~/foo/bar
-    human_path = project_dir.lstrip("-").replace("-", "/")
-    if human_path.startswith("home/"):
-        parts = human_path.split("/", 2)
-        human_path = "~/" + parts[2] if len(parts) > 2 else "~"
-
     return {
+        "tool": "claude",
         "session_id": session_id,
         "timestamp": dt_local,
         "first_prompt": first_user_prompt,
         "title": custom_title or ai_title,
         "cwd": cwd or "",
-        "project": human_path,
+        "project": human_project(cwd) if cwd else project_dir,
+    }
+
+
+def extract_omp_session_info(jsonl_path: Path) -> dict | None:
+    """Extract key info from an oh-my-pi (omp) session JSONL file.
+
+    omp writes a "title" line and a "session" header (id, cwd) up front, so
+    we stop at the first user message instead of reading the whole file.
+    """
+    session_id = cwd = title = prompt = None
+    try:
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                etype = entry.get("type")
+                if etype == "session":
+                    session_id, cwd = entry.get("id"), entry.get("cwd", "")
+                elif etype in ("title", "title_change") and entry.get("title"):
+                    title = entry["title"]
+                elif etype == "message" and entry.get("message", {}).get("role") == "user":
+                    prompt = humanize_prompt(content_text(entry["message"].get("content")))
+                    if prompt:
+                        break
+        # ponytail: mtime as "last activity", avoids reading 100MB+ of history
+        mtime = jsonl_path.stat().st_mtime
+    except OSError:
+        return None
+
+    if not session_id or not prompt:
+        return None
+    return {
+        "tool": "omp",
+        "session_id": session_id,
+        "timestamp": datetime.fromtimestamp(mtime).astimezone(),
+        "first_prompt": prompt,
+        "title": title,
+        "cwd": cwd or "",
+        "project": human_project(cwd or ""),
     }
 
 
@@ -142,15 +187,13 @@ def load_all_sessions() -> list[dict]:
     """Load all sessions from all project directories, sorted by timestamp desc."""
     sessions = []
 
-    if not PROJECTS_DIR.exists():
-        print(f"No projects directory found at {PROJECTS_DIR}", file=sys.stderr)
-        sys.exit(1)
-
-    for project_dir in PROJECTS_DIR.iterdir():
-        if not project_dir.is_dir():
-            continue
-        for jsonl_file in project_dir.glob("*.jsonl"):
-            info = extract_session_info(jsonl_file)
+    sources = [
+        (PROJECTS_DIR, extract_session_info),
+        (OMP_SESSIONS_DIR, extract_omp_session_info),
+    ]
+    for root, extract in sources:
+        for jsonl_file in root.glob("*/*.jsonl"):  # missing root = no matches
+            info = extract(jsonl_file)
             if info:
                 sessions.append(info)
 
@@ -161,6 +204,7 @@ def load_all_sessions() -> list[dict]:
 DIM = "\033[2m"
 RESET = "\033[0m"
 CYAN = "\033[36m"
+MAGENTA = "\033[35m"
 
 
 def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
@@ -188,7 +232,8 @@ def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
             display = prompt
         label = labels.get(s["session_id"])
         tag = f"{CYAN}#{label}{RESET}  " if label else ""
-        line = f"{s['session_id']}\t{tag}{dt_str}  [{project}]  {display}"
+        tool = f"{MAGENTA}omp{RESET} " if s["tool"] == "omp" else ""
+        line = f"{s['session_id']}\t{tag}{dt_str}  {tool}[{project}]  {display}"
         lines.append(line)
     return lines
 
@@ -273,11 +318,17 @@ def resume_session(session: dict, fork: bool = False) -> None:
     print(f"  Prompt  : {session['first_prompt'][:80]}")
     print()
 
-    cmd = ["claude", "--resume", session_id]
-    if fork:
-        cmd.append("--fork-session")
+    if session["tool"] == "omp":
+        # ponytail: omp has no fork flag; ctrl-f just resumes
+        if fork:
+            print("omp has no fork option, resuming instead\n")
+        cmd = ["omp", "--resume", session_id]
+    else:
+        cmd = ["claude", "--resume", session_id]
+        if fork:
+            cmd.append("--fork-session")
 
-    os.chdir(cwd)
+    os.chdir(cwd if os.path.isdir(cwd) else Path.home())
     result = subprocess.run(cmd)
     sys.exit(result.returncode)
 
