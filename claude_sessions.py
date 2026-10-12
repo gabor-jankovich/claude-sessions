@@ -205,6 +205,7 @@ DIM = "\033[2m"
 RESET = "\033[0m"
 CYAN = "\033[36m"
 MAGENTA = "\033[35m"
+YELLOW = "\033[33m"
 
 
 def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
@@ -232,8 +233,9 @@ def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
             display = prompt
         label = labels.get(s["session_id"])
         tag = f"{CYAN}#{label}{RESET}  " if label else ""
-        tool = f"{MAGENTA}omp{RESET} " if s["tool"] == "omp" else ""
-        line = f"{s['session_id']}\t{tag}{dt_str}  {tool}[{project}]  {display}"
+        # padded to equal width so the [project] column lines up
+        tool = f"{MAGENTA}omp{RESET}" if s["tool"] == "omp" else f"{YELLOW}cc {RESET}"
+        line = f"{s['session_id']}\t{tag}{dt_str}  {tool} [{project}]  {display}"
         lines.append(line)
     return lines
 
