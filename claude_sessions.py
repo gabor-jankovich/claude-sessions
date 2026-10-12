@@ -204,7 +204,7 @@ def load_all_sessions() -> list[dict]:
 DIM = "\033[2m"
 RESET = "\033[0m"
 CYAN = "\033[36m"
-MAGENTA = "\033[35m"
+MAGENTA = "\033[1;35m"  # bold
 CLAUDE_ORANGE = "\033[1;38;2;215;119;87m"  # bold mascot color, needs truecolor terminal
 
 
