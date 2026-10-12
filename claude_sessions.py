@@ -205,7 +205,7 @@ DIM = "\033[2m"
 RESET = "\033[0m"
 CYAN = "\033[36m"
 MAGENTA = "\033[35m"
-CLAUDE_ORANGE = "\033[38;2;215;119;87m"  # mascot color, needs truecolor terminal
+CLAUDE_ORANGE = "\033[1;38;2;215;119;87m"  # bold mascot color, needs truecolor terminal
 
 
 def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
