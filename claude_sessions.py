@@ -205,7 +205,7 @@ DIM = "\033[2m"
 RESET = "\033[0m"
 CYAN = "\033[36m"
 MAGENTA = "\033[35m"
-YELLOW = "\033[33m"
+CLAUDE_ORANGE = "\033[38;2;215;119;87m"  # mascot color, needs truecolor terminal
 
 
 def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
@@ -234,7 +234,7 @@ def format_for_fzf(sessions: list[dict], labels: dict[str, str]) -> list[str]:
         label = labels.get(s["session_id"])
         tag = f"{CYAN}#{label}{RESET}  " if label else ""
         # padded to equal width so the [project] column lines up
-        tool = f"{MAGENTA}omp{RESET}" if s["tool"] == "omp" else f"{YELLOW}cc {RESET}"
+        tool = f"{MAGENTA}omp{RESET}" if s["tool"] == "omp" else f"{CLAUDE_ORANGE}cc {RESET}"
         line = f"{s['session_id']}\t{tag}{dt_str}  {tool} [{project}]  {display}"
         lines.append(line)
     return lines
